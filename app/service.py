@@ -3,8 +3,11 @@
 并发约定（可串行化）：
   * 写操作（录入底图、暂存、发版、重置）一律 BEGIN IMMEDIATE —— 一开始就拿到
     写锁，事务期间其它写者进不来，读者（WAL 模式）读的是一致的旧快照；
-  * 读操作（整图/窗口/单块取数）用普通只读事务，看到的是一个一致性快照；
+  * 读操作（整图/窗口/单块/差量取数）用普通只读事务，看到的是一个一致性快照；
   * 因此任意并发的暂存、发版、取数，其结果总等价于某种依次执行的顺序。
+
+发版时"高程换版 + 差量依据 + 版本号推进"在同一个写事务内提交：
+失败（无暂存版/共边冲突）整体回滚，原版本与原差量原样保留。
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .db import connect, init_db
+from .slope import build_transition_delta, merge_transition_deltas, stitch_grid
 from .solver import TILE, NoStagedVersion, find_seam_mismatches, plan_publish
 
 
@@ -59,6 +63,18 @@ class WindowOutOfRange(ServiceError):
 class InvalidShape(ServiceError):
     status_code = 422
     code = "invalid_shape"
+
+
+class InvalidVersionRange(ServiceError):
+    status_code = 422
+    code = "invalid_version_range"
+
+
+class VersionUnavailable(ServiceError):
+    """版号在当前底图代数中不存在（从未有过，或属于重录前的旧底图）。"""
+
+    status_code = 409
+    code = "version_unavailable"
 
 
 class SeamMismatch(ServiceError):
@@ -141,7 +157,8 @@ class ElevationService:
     @staticmethod
     def _basemap_row(conn):
         return conn.execute(
-            "SELECT rows, cols, created_at FROM basemap WHERE id = 1").fetchone()
+            "SELECT rows, cols, generation, created_at FROM basemap "
+            "WHERE id = 1").fetchone()
 
     def _require_basemap(self, conn):
         bm = self._basemap_row(conn)
@@ -150,16 +167,32 @@ class ElevationService:
         return bm
 
     @staticmethod
+    def _meta(conn):
+        return conn.execute(
+            "SELECT generation, head_version FROM meta WHERE id = 1").fetchone()
+
+    @staticmethod
     def _check_coords(bm, row, col):
         if not (0 <= row < bm["rows"] and 0 <= col < bm["cols"]):
             raise TileOutOfRange(
                 f"瓦片 ({row},{col}) 超出底图范围 {bm['rows']}×{bm['cols']}",
                 row=row, col=col)
 
+    def _version_exists(self, conn, generation, version):
+        """版号必须在当前底图代数内存在；旧代数/不存在的版号返回 False。"""
+        row = conn.execute(
+            "SELECT 1 FROM releases WHERE id = ? AND generation = ?",
+            (version, generation)).fetchone()
+        return row is not None
+
     # ---- 底图 ------------------------------------------------------------
 
     def create_basemap(self, rows, cols, tiles):
-        """录入底图。tiles: {(row,col): 17×17}，必须铺满且接缝吻合。"""
+        """录入底图。tiles: {(row,col): 17×17}，必须铺满且接缝吻合。
+
+        录入即该底图代数的全局版本 1；重录（先 reset）代数 +1，旧版号
+        在差量取数时按"全量重建"处理。
+        """
         expected = {(r, c) for r in range(rows) for c in range(cols)}
         if set(tiles) != expected:
             raise InvalidShape(
@@ -172,25 +205,45 @@ class ElevationService:
         with self._write() as conn:
             if self._basemap_row(conn) is not None:
                 raise BasemapExists("底图已存在；如需重录请先 DELETE /basemap")
+            meta = self._meta(conn)
+            generation = (meta["generation"] + 1) if meta is not None else 1
             conn.execute(
-                "INSERT INTO basemap (id, rows, cols, created_at) VALUES (1,?,?,?)",
-                (rows, cols, _now()))
+                "INSERT INTO basemap (id, rows, cols, generation, created_at) "
+                "VALUES (1,?,?,?,?)", (rows, cols, generation, _now()))
             conn.executemany(
                 "INSERT INTO tiles (row, col, version, data) VALUES (?,?,1,?)",
                 [(r, c, json.dumps(tiles[(r, c)])) for (r, c) in sorted(tiles)])
-        return {"rows": rows, "cols": cols, "tiles": rows * cols}
+            # 现行图起版：版本 1，无差量依据（基线版本）
+            conn.execute(
+                "INSERT INTO releases (id, generation, created_at, note) "
+                "VALUES (1, ?, ?, 'basemap')", (generation, _now()))
+            conn.execute(
+                "INSERT INTO meta (id, generation, head_version) VALUES (1, ?, 1) "
+                "ON CONFLICT(id) DO UPDATE SET generation = excluded.generation, "
+                "head_version = 1", (generation,))
+        return {"rows": rows, "cols": cols, "tiles": rows * cols,
+                "version": 1, "generation": generation}
 
     def reset(self):
+        """删除底图与全部版本/差量数据（重录用）。代数计数保留并在下次录入时 +1。"""
         with self._write() as conn:
             conn.execute("DELETE FROM staged")
             conn.execute("DELETE FROM tiles")
             conn.execute("DELETE FROM basemap")
+            conn.execute("DELETE FROM elevation_change")
+            conn.execute("DELETE FROM slope_delta")
+            conn.execute("DELETE FROM releases")
+            meta = self._meta(conn)
+            if meta is not None:
+                conn.execute(
+                    "UPDATE meta SET head_version = 0 WHERE id = 1")
         return {"status": "reset"}
 
     def get_basemap(self):
         with self._read() as conn:
             bm = self._require_basemap(conn)
             rows, cols = bm["rows"], bm["cols"]
+            meta = self._meta(conn)
             versions = [[0] * cols for _ in range(rows)]
             staged_counts = [[0] * cols for _ in range(rows)]
             for t in conn.execute("SELECT row, col, version FROM tiles"):
@@ -199,6 +252,7 @@ class ElevationService:
                     "SELECT row, col, COUNT(*) AS n FROM staged GROUP BY row, col"):
                 staged_counts[s["row"]][s["col"]] = s["n"]
         return {"rows": rows, "cols": cols, "created_at": bm["created_at"],
+                "generation": meta["generation"], "version": meta["head_version"],
                 "versions": versions, "staged_counts": staged_counts}
 
     def get_tile(self, row, col):
@@ -208,7 +262,10 @@ class ElevationService:
             t = conn.execute(
                 "SELECT version, data FROM tiles WHERE row = ? AND col = ?",
                 (row, col)).fetchone()
+            meta = self._meta(conn)
         return {"row": row, "col": col, "version": t["version"],
+                "release_version": meta["head_version"],
+                "generation": meta["generation"],
                 "data": json.loads(t["data"])}
 
     def get_grid(self):
@@ -216,6 +273,7 @@ class ElevationService:
         with self._read() as conn:
             bm = self._require_basemap(conn)
             rows, cols = bm["rows"], bm["cols"]
+            meta = self._meta(conn)
             gh, gw = 16 * rows + 1, 16 * cols + 1
             grid = [[0] * gw for _ in range(gh)]
             versions = [[0] * cols for _ in range(rows)]
@@ -227,6 +285,7 @@ class ElevationService:
                     for j in range(TILE):
                         dst[base_c + j] = src[j]
         return {"rows": rows, "cols": cols, "grid_rows": gh, "grid_cols": gw,
+                "generation": meta["generation"], "version": meta["head_version"],
                 "versions": versions, "grid": grid}
 
     def get_window(self, row0, col0, row1, col1):
@@ -239,6 +298,7 @@ class ElevationService:
                 f"{full['grid_rows']}×{full['grid_cols']}")
         grid = [row[col0:col1 + 1] for row in full["grid"][row0:row1 + 1]]
         return {"row0": row0, "col0": col0, "row1": row1, "col1": col1,
+                "version": full["version"], "generation": full["generation"],
                 "grid": grid}
 
     # ---- 暂存 ------------------------------------------------------------
@@ -274,11 +334,18 @@ class ElevationService:
     # ---- 发版 ------------------------------------------------------------
 
     def publish(self, row, col):
-        """点名一块发版：整批原子生效；无解时报冲突边且不改任何状态。"""
+        """点名一块发版：高程换版与差量依据在同一事务内整批原子生效。
+
+        无解（无暂存版/共边冲突）时抛异常，事务回滚：现行版本、版本号与
+        已落库的差量依据全部原样保留。
+        """
         with self._write() as conn:
             bm = self._require_basemap(conn)
             rows, cols = bm["rows"], bm["cols"]
+            generation = bm["generation"]
             self._check_coords(bm, row, col)
+            meta = self._meta(conn)
+            head = meta["head_version"]
 
             current, versions = {}, {}
             for t in conn.execute("SELECT row, col, version, data FROM tiles"):
@@ -301,27 +368,113 @@ class ElevationService:
                 raise NoStaged(f"瓦片 ({row},{col}) 没有暂存版，无法点名发版",
                                tile={"row": row, "col": col})
             if conflicts:
-                # 事务随异常回滚：现行底图与暂存原样保留
+                # 事务随异常回滚：现行底图、版本号与差量依据原样保留
                 raise PublishConflict(
-                    "不存在共边全部吻合的发版方案，现行底图与暂存均未改动",
+                    "不存在共边全部吻合的发版方案，现行底图与差量均未改动",
                     conflicting_edges=[
                         {"tile_a": {"row": a[0], "col": a[1]},
                          "tile_b": {"row": b[0], "col": b[1]}}
                         for a, b in conflicts])
 
+            # 差量依据：先在整图上算好，再与高程换版同事务落库
+            old_grid = stitch_grid(rows, cols, current)
+            new_tiles = dict(current)
+            for t in chosen:
+                new_tiles[t] = staged[t]
+            new_grid = stitch_grid(rows, cols, new_tiles)
+            changed_cells, delta_rows = build_transition_delta(old_grid, new_grid)
+
+            new_version = head + 1
+            conn.execute(
+                "INSERT INTO releases (id, generation, created_at, note) "
+                "VALUES (?, ?, ?, 'publish')",
+                (new_version, generation, _now()))
+            conn.executemany(
+                "INSERT INTO elevation_change "
+                "(from_version, to_version, row, col, old_value, new_value) "
+                "VALUES (?,?,?,?,?,?)",
+                [(head, new_version, r_, c_, ov, nv)
+                 for r_, c_, ov, nv in changed_cells])
+            conn.executemany(
+                "INSERT INTO slope_delta "
+                "(from_version, to_version, row, col, old_ew, new_ew, old_ns, new_ns) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                [(head, new_version, d["row"], d["col"],
+                  d["old_ew"], d["new_ew"], d["old_ns"], d["new_ns"])
+                 for d in delta_rows])
+
             changed, cleared = [], []
             for (r, c) in sorted(chosen):
-                new_version = versions[(r, c)] + 1
+                tile_version = versions[(r, c)] + 1
                 conn.execute(
                     "UPDATE tiles SET version = ?, data = ? "
                     "WHERE row = ? AND col = ?",
-                    (new_version, json.dumps(staged[(r, c)]), r, c))
+                    (tile_version, json.dumps(staged[(r, c)]), r, c))
                 sid = staged_ids[(r, c)]
                 conn.execute("DELETE FROM staged WHERE id = ?", (sid,))
-                changed.append({"row": r, "col": c, "version": new_version})
+                changed.append({"row": r, "col": c, "version": tile_version})
                 cleared.append(sid)
+
+            conn.execute("UPDATE meta SET head_version = ? WHERE id = 1",
+                         (new_version,))
 
         return {"status": "published",
                 "named_tile": {"row": row, "col": col},
+                "version": new_version, "generation": generation,
                 "changed_tiles": changed,
-                "cleared_staged_ids": sorted(cleared)}
+                "cleared_staged_ids": sorted(cleared),
+                "elevation_changes": len(changed_cells),
+                "slope_delta_cells": len(delta_rows)}
+
+    # ---- 坡度差量取数 ----------------------------------------------------
+
+    def get_delta(self, from_version, to_version=None):
+        """差量取数：返回 from_version -> to_version 间坡度分量有变化的内部格点。
+
+        差量依据在每次发版时已落库，这里只做只读合并，因此重启后按同一对
+        版号仍取到完全相同的结果。版号缺失或属于重录前的旧底图时，提示
+        下游全量重建。
+        """
+        with self._read() as conn:
+            bm = self._require_basemap(conn)
+            generation = bm["generation"]
+            meta = self._meta(conn)
+            head = meta["head_version"]
+            if to_version is None:
+                to_version = head
+            if from_version < 1 or to_version < 1:
+                raise InvalidVersionRange(
+                    f"非法版号区间 [{from_version}, {to_version}]：版号必须为正整数",
+                    from_version=from_version, to_version=to_version,
+                    current_version=head)
+            # 先判定版号是否属于当前底图代数：旧代数/不存在的版号一律全量重建
+            # （重录后当前版可能小于本地已入仓版号，此情形不能误判为区间非法）
+            if not (self._version_exists(conn, generation, from_version)
+                    and self._version_exists(conn, generation, to_version)):
+                raise VersionUnavailable(
+                    "请求的版号在当前底图中不存在（可能从未发版，或属于重录前"
+                    "的旧底图）；差量无法续算，请基于当前整图全量重建坡度仓",
+                    from_version=from_version, to_version=to_version,
+                    current_version=head, rebuild_required=True)
+            if from_version > to_version:
+                raise InvalidVersionRange(
+                    f"非法版号区间 [{from_version}, {to_version}]：要求 "
+                    f"from_version <= to_version（当前版 {head}）",
+                    from_version=from_version, to_version=to_version,
+                    current_version=head)
+
+            if from_version == to_version:
+                records = []
+            else:
+                records = [dict(r) for r in conn.execute(
+                    "SELECT row, col, old_ew, new_ew, old_ns, new_ns "
+                    "FROM slope_delta WHERE from_version >= ? AND from_version < ? "
+                    "ORDER BY from_version, row, col",
+                    (from_version, to_version))]
+            gh, gw = 16 * bm["rows"] + 1, 16 * bm["cols"] + 1
+
+        changes = merge_transition_deltas(records)
+        return {"from_version": from_version, "to_version": to_version,
+                "generation": generation, "current_version": head,
+                "grid_rows": gh, "grid_cols": gw,
+                "change_count": len(changes), "changes": changes}

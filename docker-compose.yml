@@ -9,6 +9,23 @@ services:
     volumes:
       - elev_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 一次性演示：下游坡度仓一次追平多次发版（含回改跳过、重录全量重建）。
+  # 用法：docker compose up --build 后，另开终端执行 docker compose run --rm demo
+  demo:
+    build: .
+    container_name: elevation-demo
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "demo/catch_up_demo.py", "http://api:8000"]
+    volumes:
+      - ./demo:/app/demo:ro
 
 volumes:
   elev_data:
